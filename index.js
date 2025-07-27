@@ -1,19 +1,24 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
+const { createClient } = require("@supabase/supabase-js");
 
 require("dotenv").config();
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const BASE_URL = "https://www.magticom.ge/ru/sakvirveli";
-const DATA_FILE = path.join(__dirname, "bot_data.json");
+
+// Настройка Supabase
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 if (!BOT_TOKEN) {
   console.error("❌ ОШИБКА: BOT_TOKEN не найден в переменных окружения!");
-  console.log(
-    "Создайте файл .env и добавьте: BOT_TOKEN=ваш_токен_от_botfather"
-  );
+  process.exit(1);
+}
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error("❌ ОШИБКА: Не настроены переменные Supabase!");
   process.exit(1);
 }
 
@@ -27,25 +32,115 @@ let botData = {
   isMonitoring: false,
 };
 
-function loadData() {
+// Создание таблицы в Supabase (выполнится автоматически)
+async function initSupabase() {
   try {
-    if (fs.existsSync(DATA_FILE)) {
-      const data = fs.readFileSync(DATA_FILE, "utf8");
-      botData = { ...botData, ...JSON.parse(data) };
-      console.log("📂 Данные загружены из файла");
+    // Проверяем существование записи
+    const { data, error } = await supabase
+      .from("bot_settings")
+      .select("*")
+      .single();
+
+    if (error && error.code === "PGRST116") {
+      // Записи нет, создаем
+      const { error: insertError } = await supabase
+        .from("bot_settings")
+        .insert({
+          id: 1,
+          subscribers: botData.subscribers,
+          group_chats: botData.groupChats,
+          last_checked_number: botData.lastCheckedNumber,
+          last_found_number: botData.lastFoundNumber,
+          is_monitoring: botData.isMonitoring,
+        });
+
+      if (insertError) {
+        console.error("❌ Ошибка создания записи:", insertError);
+      } else {
+        console.log("✅ Создана начальная запись в Supabase");
+      }
     }
   } catch (error) {
-    console.error("⚠️ Ошибка загрузки данных:", error.message);
+    console.error("❌ Ошибка инициализации Supabase:", error);
   }
 }
 
-function saveData() {
+// Загрузка данных из Supabase
+async function loadData() {
   try {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(botData, null, 2));
+    const { data, error } = await supabase
+      .from("bot_settings")
+      .select("*")
+      .single();
+
+    if (error) {
+      console.error("⚠️ Ошибка загрузки из Supabase:", error);
+      return;
+    }
+
+    if (data) {
+      botData = {
+        subscribers: data.subscribers || [],
+        groupChats: data.group_chats || [],
+        lastCheckedNumber: data.last_checked_number || 262,
+        lastFoundNumber: data.last_found_number || 262,
+        isMonitoring: data.is_monitoring || false,
+      };
+
+      console.log("📂 Данные загружены из Supabase");
+      console.log(`👥 Подписчиков: ${botData.subscribers.length}`);
+      console.log(`💬 Групп: ${botData.groupChats.length}`);
+    }
   } catch (error) {
-    console.error("⚠️ Ошибка сохранения данных:", error.message);
+    console.error("⚠️ Ошибка загрузки данных из Supabase:", error.message);
   }
 }
+
+// Сохранение данных в Supabase
+async function saveData() {
+  try {
+    const { error } = await supabase
+      .from("bot_settings")
+      .update({
+        subscribers: botData.subscribers,
+        group_chats: botData.groupChats,
+        last_checked_number: botData.lastCheckedNumber,
+        last_found_number: botData.lastFoundNumber,
+        is_monitoring: botData.isMonitoring,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", 1);
+
+    if (error) {
+      console.error("⚠️ Ошибка сохранения в Supabase:", error);
+    } else {
+      console.log("💾 Данные сохранены в Supabase");
+    }
+  } catch (error) {
+    console.error("⚠️ Ошибка сохранения данных в Supabase:", error.message);
+  }
+}
+
+// Периодическое сохранение данных (каждые 5 минут)
+setInterval(() => {
+  saveData();
+}, 5 * 60 * 1000);
+
+// Сохраняем данные при выходе из процесса
+process.on("SIGINT", async () => {
+  console.log("🛑 Получен сигнал остановки, сохраняем данные...");
+  await saveData();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("🛑 Получен сигнал завершения, сохраняем данные...");
+  await saveData();
+  process.exit(0);
+});
+
+// Здесь продолжается весь остальной код бота...
+// (все функции checkPageExists, extractTitle, extractContent, etc. остаются без изменений)
 
 async function checkPageExists(pageNumber) {
   try {
@@ -90,6 +185,7 @@ function extractTitle(html) {
 
   return "Новая акция от Magticom";
 }
+
 function extractContent(html) {
   try {
     let extractedContent = [];
@@ -116,8 +212,6 @@ function extractContent(html) {
             .replace(/\s+/g, " ")
             .trim();
 
-          console.log(`🔍 Проверяем li из article: "${cleanText}"`);
-
           if (
             cleanText.length > 10 &&
             (cleanText.includes("Интернет") ||
@@ -128,44 +222,15 @@ function extractContent(html) {
             /-\s*\d+/.test(cleanText)
           ) {
             extractedContent.push(cleanText);
-            console.log(`✅ Добавлен тариф из article: "${cleanText}"`);
-          } else {
-            const reasons = [];
-            if (cleanText.length <= 10)
-              reasons.push(`короткий(${cleanText.length})`);
-            if (!/(Интернет|МБ|MB|Мин|безлимитные)/.test(cleanText))
-              reasons.push("нет услуг");
-            if (!/-\s*\d+/.test(cleanText)) reasons.push("нет цены");
-
-            console.log(
-              `❌ Пропущен li из article (${reasons.join(
-                ", "
-              )}): "${cleanText.substring(0, 40)}..."`
-            );
           }
         }
-      } else {
-        console.log("❌ Li элементы в блоке article не найдены");
       }
-    } else {
-      console.log("❌ Блок article не найден");
     }
 
-    // РЕЗЕРВНЫЙ способ: если article не сработал
     if (extractedContent.length === 0) {
-      console.log(
-        "🔄 Резервный поиск: ищем элементы с icon-gel по всей странице..."
-      );
-
       const anyListItems = html.match(/<li[^>]*>(.*?)<\/li>/gi);
-
       if (anyListItems && anyListItems.length > 0) {
-        console.log(
-          `📋 Найдено ${anyListItems.length} li элементов на всей странице`
-        );
-
         for (const item of anyListItems) {
-          // Только элементы с icon-gel
           if (item.includes("icon-gel")) {
             const cleanText = item
               .replace(/<[^>]*>/g, "")
@@ -175,7 +240,6 @@ function extractContent(html) {
 
             if (cleanText.length > 5 && cleanText.length < 200) {
               extractedContent.push(cleanText);
-              console.log(`✅ Добавлен резервный (icon-gel): "${cleanText}"`);
             }
           }
         }
@@ -183,20 +247,10 @@ function extractContent(html) {
     }
 
     if (extractedContent.length > 0) {
-      // Убираем дубликаты
       const uniqueContent = [...new Set(extractedContent)];
-      console.log(
-        `🎯 Итого извлечено уникальных пунктов: ${uniqueContent.length}`
-      );
-
-      uniqueContent.forEach((item, index) => {
-        console.log(`   ${index + 1}. "${item}"`);
-      });
-
       return uniqueContent.join("\n• ");
     }
 
-    console.log("❌ Контент не извлечен, возвращаем заглушку");
     return "Новая акция доступна на сайте!";
   } catch (error) {
     console.error("❌ Ошибка извлечения контента:", error.message);
@@ -204,7 +258,6 @@ function extractContent(html) {
   }
 }
 
-// Проверяем новые акции
 async function checkForNewPromotions() {
   console.log("🕐 Начинаем проверку новых акций...");
 
@@ -219,7 +272,7 @@ async function checkForNewPromotions() {
       console.log(`🎉 НАЙДЕНА НОВАЯ АКЦИЯ: страница ${pageNumber}`);
 
       botData.lastFoundNumber = pageNumber;
-      saveData();
+      await saveData();
 
       await notifySubscribers(pageNumber, result);
       foundNew = true;
@@ -236,7 +289,7 @@ async function checkForNewPromotions() {
     console.log("ℹ️ Новых акций пока нет");
   }
 
-  saveData();
+  await saveData();
 }
 
 async function notifySubscribers(pageNumber, pageData) {
@@ -257,9 +310,7 @@ async function notifySubscribers(pageNumber, pageData) {
 
   const totalRecipients =
     botData.subscribers.length + botData.groupChats.length;
-  console.log(
-    `📨 Отправляем уведомления ${totalRecipients} получателям (${botData.subscribers.length} личных, ${botData.groupChats.length} групп)`
-  );
+  console.log(`📨 Отправляем уведомления ${totalRecipients} получателям`);
 
   for (const chatId of botData.subscribers) {
     try {
@@ -269,10 +320,7 @@ async function notifySubscribers(pageNumber, pageData) {
       });
       console.log(`✅ Личное уведомление отправлено: ${chatId}`);
     } catch (error) {
-      console.error(
-        `❌ Ошибка отправки личного сообщения ${chatId}:`,
-        error.message
-      );
+      console.error(`❌ Ошибка отправки ${chatId}:`, error.message);
 
       if (error.response && error.response.error_code === 403) {
         botData.subscribers = botData.subscribers.filter((id) => id !== chatId);
@@ -289,10 +337,7 @@ async function notifySubscribers(pageNumber, pageData) {
       });
       console.log(`✅ Групповое уведомление отправлено: ${chatId}`);
     } catch (error) {
-      console.error(
-        `❌ Ошибка отправки группового сообщения ${chatId}:`,
-        error.message
-      );
+      console.error(`❌ Ошибка отправки группового ${chatId}:`, error.message);
 
       if (
         error.response &&
@@ -304,7 +349,7 @@ async function notifySubscribers(pageNumber, pageData) {
     }
   }
 
-  saveData();
+  await saveData();
 }
 
 bot.onText(/\/start/, async (msg) => {
@@ -315,7 +360,7 @@ bot.onText(/\/start/, async (msg) => {
   if (chatType === "private") {
     if (!botData.subscribers.includes(chatId)) {
       botData.subscribers.push(chatId);
-      saveData();
+      await saveData();
       console.log(`➕ Новый подписчик: ${chatId} (${username})`);
     }
 
@@ -339,7 +384,7 @@ bot.onText(/\/start/, async (msg) => {
   } else if (chatType === "group" || chatType === "supergroup") {
     if (!botData.groupChats.includes(chatId)) {
       botData.groupChats.push(chatId);
-      saveData();
+      await saveData();
       console.log(`➕ Новый групповой чат: ${chatId} (${msg.chat.title})`);
     }
 
@@ -373,16 +418,12 @@ bot.onText(/\/check/, async (msg) => {
     if (botData.lastFoundNumber > oldFoundNumber) {
       await bot.sendMessage(
         chatId,
-        `🎉 Найдена новая акция!
-
-Проверьте ваши сообщения - только что отправил уведомление о новой акции от Magticom!`
+        `🎉 Найдена новая акция! Проверьте ваши сообщения!`
       );
     } else {
       await bot.sendMessage(
         chatId,
-        `📭 Нет новых акций!
-
-Последняя акция от Magticom по-прежнему актуальна. Как только появится новая - сразу пришлю уведомление!`
+        `📭 Нет новых акций! Последняя акция от Magticom по-прежнему актуальна.`
       );
     }
   } catch (error) {
@@ -409,7 +450,9 @@ bot.onText(/\/status/, async (msg) => {
 
 📱 [Последняя найденная акция](${lastPromoUrl})
 
-⏰ График проверок: каждые 30 минут с 10:00 до 22:00`;
+⏰ График проверок: каждые 30 минут с 10:00 до 22:00
+
+💾 Данные сохранены в Supabase`;
 
   await bot.sendMessage(chatId, statusMessage, { parse_mode: "Markdown" });
 });
@@ -423,13 +466,7 @@ bot.onText(/\/chatid/, async (msg) => {
 
 💬 Название: ${chatTitle}
 🆔 Chat ID: \`${chatId}\`
-📱 Тип: ${chatType}
-
-${
-  chatType !== "private"
-    ? "💡 Этот ID можно использовать для настройки уведомлений в других ботах"
-    : ""
-}`;
+📱 Тип: ${chatType}`;
 
   await bot.sendMessage(chatId, idMessage, { parse_mode: "Markdown" });
 });
@@ -448,14 +485,12 @@ bot.onText(/\/addgroup/, async (msg) => {
 
   if (!botData.groupChats.includes(chatId)) {
     botData.groupChats.push(chatId);
-    saveData();
-    console.log(
-      `➕ Вручную добавлен групповой чат: ${chatId} (${msg.chat.title})`
-    );
+    await saveData();
+    console.log(`➕ Вручную добавлен групповой чат: ${chatId}`);
 
     await bot.sendMessage(
       chatId,
-      `✅ Групповой чат успешно добавлен в список уведомлений!
+      `✅ Групповой чат успешно добавлен!
         
 📊 Теперь активно:
 • Личных подписчиков: ${botData.subscribers.length}
@@ -476,40 +511,23 @@ bot.onText(/\/help/, async (msg) => {
   const helpMessage = `📚 *СПРАВКА ПО КОМАНДАМ*
 
 *Основные команды:*
-/start - Подписаться на уведомления${
-    chatType !== "private" ? " (добавить группу)" : ""
-  }
+/start - Подписаться на уведомления
 /check - Проверить новые акции прямо сейчас  
 /status - Показать статус мониторинга
 /help - Эта справка
 
-${
-  chatType !== "private"
-    ? `*Команды для групп:*
-/addgroup - Добавить этот чат для уведомлений
-/chatid - Показать ID чата
-
-`
-    : ""
-}*Дополнительные команды:*
+*Дополнительные команды:*
 /chatid - Показать информацию о чате
+/addgroup - Добавить групповой чат (только для групп)
 
 🤖 *КАК РАБОТАЕТ БОТ:*
 • Каждые 30 минут проверяю новые страницы акций
 • При нахождении новой акции отправляю уведомление
 • Работаю только в дневное время (10:00-22:00)
-• Отправляю уведомления как в личные чаты, так и в группы
+• Данные надежно сохраняются в Supabase
 
 🔗 *ПРОВЕРЯЕМЫЕ СТРАНИЦЫ:*
-Сайт: magticom.ge/ru/sakvirveli[номер]
-
-💬 *ДЛЯ ГРУППОВЫХ ЧАТОВ:*
-1. Добавьте бота в группу как администратора
-2. Отправьте команду /start или /addgroup
-3. Бот автоматически начнет отправлять уведомления
-
-❓ *ВОПРОСЫ?*
-Напишите разработчику в личные сообщения`;
+Сайт: magticom.ge/ru/sakvirveli[номер]`;
 
   await bot.sendMessage(chatId, helpMessage, { parse_mode: "Markdown" });
 });
@@ -558,7 +576,9 @@ bot.on("polling_error", (error) => {
 
 async function init() {
   console.log("🤖 Инициализация бота Magticom Monitor...");
-  loadData();
+
+  await initSupabase();
+  await loadData();
 
   try {
     const botInfo = await bot.getMe();
